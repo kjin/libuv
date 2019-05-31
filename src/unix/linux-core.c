@@ -39,6 +39,7 @@
 #include <sys/param.h>
 #include <sys/prctl.h>
 #include <sys/sysinfo.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -1014,15 +1015,257 @@ uint64_t uv_get_total_memory(void) {
   return 0;
 }
 
+#define CGROUPS_VERSION_UNKNOWN 0x0
+#define CGROUPS_VERSION_1 0x1
+#define CGROUPS_VERSION_2 0x2
+#define CGROUPS_V2_CTRL_PREFIX "0::"
+#define CGROUPS_V2_CTRL_PREFIX_LEN strlen(CGROUPS_V2_CTRL_PREFIX)
+#define CGROUPS_V2_NO_LIMIT_VALUE "max"
 
-static uint64_t uv__read_cgroups_uint64(const char* cgroup, const char* param) {
+
+typedef struct {
+  /* cgroups version, one of CGROUPS_VERSION_*. */
+  uint8_t cgroups_version;
+  /* Path in which param files are found for a subsystem. */
+  char path[4096];
+} uv__cgroups_subsystem_info_t;
+
+
+/*
+ * Writes `start` to `field_start` and the length of the current
+ * whitespace-delimited field to `field_len`, and returns an pointer to the
+ * remainder of the string (excluding the whitespace).
+ * Note that we assume that `start` ends with "\n\0".
+ */
+static const char* uv__mountinfo_next_field(const char* start,
+    const char** field_start, size_t* field_len) {
+  size_t len;
+  const char* field_end;
+  if ('\0' == *start)
+    return 0;
+  field_end = strchr(start, ' ');
+  if (field_end == NULL) {
+    len = strlen(start) - 1; /* -1 to lop off newline */
+  } else {
+    len = field_end - start;
+  }
+  if (field_start != NULL) {
+    *field_start = start;
+  }
+  if (field_len != NULL) {
+    *field_len = len;
+  }
+  return start + len + 1;
+}
+
+
+/*
+ * Given a comma-delimited sequence of strings `super_options` (w/ size
+ * `super_options_len`), return TRUE if option exactly matches one of the
+ * elements in that sequence.
+ */
+static int uv__mountinfo_find_super_option(const char* super_options,
+    size_t super_options_len, const char* option) {
+  size_t option_len = strlen(option);
+  const char* low = super_options;
+  const char* high = super_options + super_options_len - option_len;
+  const char* preceding_char;
+  const char* succeeding_char;
+  while (strlen(low)) {
+    low = strstr(low, option);
+    if (low == NULL || low > high)
+      break;
+    preceding_char = low - 1;
+    succeeding_char = low + option_len;
+    if (low == super_options || ',' == *preceding_char) {
+      /*
+       * The occurrence of `option` is preceded by a comma, or is part of the
+       * first entry in `super_options`.
+       */
+      if (' ' == *succeeding_char || ',' == *succeeding_char || '\n' == *succeeding_char)
+        /*
+         * The occurrence of `option` is succeeded by a comma, or is part of the
+         * last entry in `super_options`.
+         */
+        return 1;
+    }
+  }
+  return 0;
+}
+
+
+/*
+ * Read /proc/self/mountinfo and /proc/self/cgroup to get info about how the
+ * given subsystem is controlled for this process, and the path to the
+ * subsystem's parameter files, if possible.
+ */
+static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const char* subsystem) {
+  FILE* fp;
+  /* Should be big enough to fit a single line. */
+  char buf[4096];
+  /*
+   * See description of /proc/[pid]/mountinfo in proc(5).
+   * Henceforth, numbers in parentheses refer to fields from the docs.
+   */
+  const char* field_ptr;
+  const char* field_start[10];
+  size_t field_len[10];
+  size_t field_idx;
+  char root[1024]; /* (4) */
+  char mount_point[1024]; /* (5) */
+  /* From /proc/self/cgroup */
+  char hierarchy_path[1024];
+  /* Should be big enough to fit a subsystem name, plus 2 more characters. */
+  char subsystem_search_string[64];
+  const char* subsystem_search_ptr;
+  const char* hierarchy_path_inner;
+
+  info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+
+  /* Read /proc/self/mountinfo to get controller path. */
+
+  fp = uv__open_file("/proc/self/mountinfo");
+  if (fp == NULL)
+    return UV__ERR(errno);
+  /*
+   * Loop once per line; try to find the mount location for the given subsystem.
+   */
+  while (1) {
+    if (fgets(buf, 4096, fp) == NULL) {
+      if (feof(fp))
+        break;
+      goto file_malformed;
+    }
+    field_ptr = buf;
+    field_idx = 0;
+    /* Read fields (1) thru (7), assigning them to indices 0 thru 6. */
+    for (field_idx = 0; field_idx < 7; field_idx++) {
+      if (!field_ptr)
+        goto file_malformed;
+      field_ptr = uv__mountinfo_next_field(field_ptr, &field_start[field_idx], &field_len[field_idx]);
+    }
+    /* A hyphen (8) marks the end of variable-length optional fields (7). */
+    while ('-' == field_ptr[0]) {
+      if (!field_ptr)
+        goto file_malformed;
+      field_ptr = uv__mountinfo_next_field(field_ptr, NULL, NULL);
+    }
+    /*
+     * The field length for optional fields (7) is inaccurate; just set it to 0
+     * to help futureproof from potential bugs (we don't read this field).
+     */
+    field_len[6] = 0;
+    /* Read fields (9) thru (11), assigning them to indices 7 thru 9. */
+    for (field_idx = 7; field_idx < 10; field_idx++) {
+      if (!field_ptr)
+        goto file_malformed;
+      field_ptr = uv__mountinfo_next_field(field_ptr, &field_start[field_idx], &field_len[field_idx]);
+    }
+    /*
+     * If the fs type (9) is "cgroup" and super options (11) contains the name
+     * of the subsystem, then we've found the correct mount location, so save
+     * the values of root (4) and mount point (5) and break.
+     * Otherwise, if the fs type is "cgroup2", we've potentially found the
+     * correct mount location, so save the above values, but don't break,
+     * because we don't know yet whether the input subsystem is controlled by
+     * cgroups v1 or v2.
+     */
+    if (!strncmp(field_start[7], "cgroup", strlen("cgroup"))) {
+      if (6 == field_len[7]) {
+        /* cgroups v1 */
+        if (uv__mountinfo_find_super_option(field_start[9], field_len[9], subsystem)) {
+          strncpy(root, field_start[3], field_len[3]);
+          root[field_len[3]] = '\0';
+          strncpy(mount_point, field_start[4], field_len[4]);
+          mount_point[field_len[4]] = '\0';
+          info->cgroups_version = CGROUPS_VERSION_1;
+          break;
+        }
+      } else if (7 == field_len[7] && '2' == field_start[7][6]) {
+        /* cgroups v2 */
+        strncpy(root, field_start[3], field_len[3]);
+        root[field_len[3]] = '\0';
+        strncpy(mount_point, field_start[4], field_len[4]);
+        mount_point[field_len[4]] = '\0';
+        info->cgroups_version = CGROUPS_VERSION_2;
+        /* But don't break. */
+      }
+    }
+  }
+
+  fclose(fp);
+
+  /*
+   * If cgroups version wasn't determined, assume this subsystem isn't enabled
+   * in cgroups, so don't bother reading /proc/self/cgroup.
+   */
+  if (CGROUPS_VERSION_UNKNOWN == info->cgroups_version)
+    return 0;
+  
+  /* Read /proc/self/cgroup to get hierarchy path. */
+
+  hierarchy_path[0] = '\0';
+
+  fp = uv__open_file("/proc/self/cgroup");
+  if (fp == NULL)
+    return UV__ERR(errno);
+  
+  /* + 3 for two colons, and terminal character. */
+  snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
+
+  while (1) {
+    if (fgets(buf, 4096, fp) == NULL) {
+      if (feof(fp))
+        break;
+      goto file_malformed;
+    }
+    if (CGROUPS_VERSION_1 == info->cgroups_version) {
+      subsystem_search_ptr = strstr(buf, subsystem_search_string);
+      if (subsystem_search_ptr) {
+        strncpy(hierarchy_path,
+            subsystem_search_ptr + strlen(subsystem_search_string),
+            strlen(subsystem_search_ptr) - strlen(subsystem_search_string) - 1);
+        break;
+      }
+    } else { /* if (CGROUPS_VERSION_2 == info->cgroups_version) */
+      if (!strncmp(buf, CGROUPS_V2_CTRL_PREFIX, CGROUPS_V2_CTRL_PREFIX_LEN)) {
+        /* - 1 to remove newline. */
+        strncpy(hierarchy_path, buf + CGROUPS_V2_CTRL_PREFIX_LEN,
+            strlen(buf) - CGROUPS_V2_CTRL_PREFIX_LEN - 1);
+        break;
+      }
+    }
+  }
+
+  fclose(fp);
+
+  /*
+   * The hierarchy path should be prefixed with the root path from mountinfo,
+   * and should be replaced with the mount point.
+   */
+  if (strncmp(hierarchy_path, root, strlen(root))) {
+    info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+    return 0;
+  }
+  hierarchy_path_inner = hierarchy_path + strlen(root);
+  snprintf(info->path, 4096, "%s/%s", mount_point, hierarchy_path_inner);
+  return 0;
+
+file_malformed:
+  fclose(fp);
+  info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+  return UV_EIO;
+}
+
+
+static uint64_t uv__read_cgroups_uint64(const char* path, const char* param) {
   char filename[256];
   uint64_t rc;
   int fd;
   ssize_t n;
   char buf[32];  /* Large enough to hold an encoded uint64_t. */
 
-  snprintf(filename, 256, "/sys/fs/cgroup/%s/%s", cgroup, param);
+  snprintf(filename, 256, "%s/%s", path, param);
 
   rc = 0;
   fd = uv__open_cloexec(filename, O_RDONLY);
@@ -1034,7 +1277,10 @@ static uint64_t uv__read_cgroups_uint64(const char* cgroup, const char* param) {
 
   if (n > 0) {
     buf[n] = '\0';
-    sscanf(buf, "%" PRIu64, &rc);
+    if (!strcmp(buf, CGROUPS_V2_NO_LIMIT_VALUE))
+      rc = 0;
+    else
+      sscanf(buf, "%" PRIu64, &rc);
   }
 
   if (uv__close_nocheckstdio(fd))
@@ -1045,10 +1291,26 @@ static uint64_t uv__read_cgroups_uint64(const char* cgroup, const char* param) {
 
 
 uint64_t uv_get_constrained_memory(void) {
+  uv__cgroups_subsystem_info_t info;
+  /* For v2 only. */
+  uint64_t max, high;
+
+  if (uv__read_cgroups_proc_files(&info, "memory"))
+    return 0;
+
   /*
    * This might return 0 if there was a problem getting the memory limit from
    * cgroups. This is OK because a return value of 0 signifies that the memory
    * limit is unknown.
    */
-  return uv__read_cgroups_uint64("memory", "memory.limit_in_bytes");
+  if (CGROUPS_VERSION_1 == info.cgroups_version)
+    return uv__read_cgroups_uint64(info.path, "memory.limit_in_bytes");
+  else if (CGROUPS_VERSION_2 == info.cgroups_version) {
+    max = uv__read_cgroups_uint64(info.path, "memory.max");
+    high = uv__read_cgroups_uint64(info.path, "memory.high");
+    if (max == 0 || high == 0)
+      return 0;
+    return max > high ? max : high;
+  } else /* if (CGROUPS_VERSION_UNKNOWN == info.cgroups_version) */
+    return 0;
 }
