@@ -1015,19 +1015,23 @@ uint64_t uv_get_total_memory(void) {
   return 0;
 }
 
+
+#define PROC_SELF_MOUNTINFO "/proc/self/mountinfo"
+#define PROC_SELF_CGROUP "/proc/self/cgroup"
 #define CGROUPS_VERSION_UNKNOWN 0x0
 #define CGROUPS_VERSION_1 0x1
 #define CGROUPS_VERSION_2 0x2
 #define CGROUPS_V2_CTRL_PREFIX "0::"
-#define CGROUPS_V2_CTRL_PREFIX_LEN strlen(CGROUPS_V2_CTRL_PREFIX)
+#define CGROUPS_V2_CTRL_PREFIX_LEN 3
 #define CGROUPS_V2_NO_LIMIT_VALUE "max"
+#define CGROUPS_BUF_SIZE 4096
 
 
 typedef struct {
   /* cgroups version, one of CGROUPS_VERSION_*. */
   uint8_t cgroups_version;
   /* Path in which param files are found for a subsystem. */
-  char path[4096];
+  char path[CGROUPS_BUF_SIZE];
 } uv__cgroups_subsystem_info_t;
 
 
@@ -1102,7 +1106,7 @@ static int uv__mountinfo_find_super_option(const char* super_options,
 static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const char* subsystem) {
   FILE* fp;
   /* Should be big enough to fit a single line. */
-  char buf[4096];
+  char buf[CGROUPS_BUF_SIZE];
   /*
    * See description of /proc/[pid]/mountinfo in proc(5).
    * Henceforth, numbers in parentheses refer to fields from the docs.
@@ -1111,12 +1115,15 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   const char* field_start[10];
   size_t field_len[10];
   size_t field_idx;
-  char root[1024]; /* (4) */
-  char mount_point[1024]; /* (5) */
+  char root[CGROUPS_BUF_SIZE]; /* (4) */
+  char mount_point[CGROUPS_BUF_SIZE]; /* (5) */
   /* From /proc/self/cgroup */
-  char hierarchy_path[1024];
-  /* Should be big enough to fit a subsystem name, plus 2 more characters. */
-  char subsystem_search_string[64];
+  char hierarchy_path[CGROUPS_BUF_SIZE];
+  /*
+   * Should be big enough to fit a subsystem name, plus 2 more characters.
+   * The longest known subsystem name (from cgroups docs) is "perf_event".
+   */
+  char subsystem_search_string[16];
   const char* subsystem_search_ptr;
   const char* hierarchy_path_inner;
 
@@ -1124,37 +1131,35 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 
   /* Read /proc/self/mountinfo to get controller path. */
 
-  fp = uv__open_file("/proc/self/mountinfo");
+  fp = uv__open_file(PROC_SELF_MOUNTINFO);
   if (fp == NULL)
     return UV__ERR(errno);
   /*
    * Loop once per line; try to find the mount location for the given subsystem.
    */
   while (1) {
-    if (fgets(buf, 4096, fp) == NULL) {
+    if (fgets(buf, CGROUPS_BUF_SIZE, fp) == NULL) {
       if (feof(fp))
         break;
       goto file_malformed;
     }
     field_ptr = buf;
     field_idx = 0;
-    /* Read fields (1) thru (7), assigning them to indices 0 thru 6. */
-    for (field_idx = 0; field_idx < 7; field_idx++) {
+    /* Read fields (1) thru (6), assigning them to indices 0 thru 5. */
+    for (field_idx = 0; field_idx < 6; field_idx++) {
       if (!field_ptr)
         goto file_malformed;
       field_ptr = uv__mountinfo_next_field(field_ptr, &field_start[field_idx], &field_len[field_idx]);
     }
     /* A hyphen (8) marks the end of variable-length optional fields (7). */
-    while ('-' == field_ptr[0]) {
+    field_start[field_idx] = field_ptr;
+    field_len[field_idx] = 0; /* Not used. */
+    while ('-' != field_ptr[0]) {
       if (!field_ptr)
         goto file_malformed;
       field_ptr = uv__mountinfo_next_field(field_ptr, NULL, NULL);
     }
-    /*
-     * The field length for optional fields (7) is inaccurate; just set it to 0
-     * to help futureproof from potential bugs (we don't read this field).
-     */
-    field_len[6] = 0;
+    field_ptr = uv__mountinfo_next_field(field_ptr, NULL, NULL);
     /* Read fields (9) thru (11), assigning them to indices 7 thru 9. */
     for (field_idx = 7; field_idx < 10; field_idx++) {
       if (!field_ptr)
@@ -1206,7 +1211,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 
   hierarchy_path[0] = '\0';
 
-  fp = uv__open_file("/proc/self/cgroup");
+  fp = uv__open_file(PROC_SELF_CGROUP);
   if (fp == NULL)
     return UV__ERR(errno);
   
@@ -1214,7 +1219,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
   while (1) {
-    if (fgets(buf, 4096, fp) == NULL) {
+    if (fgets(buf, CGROUPS_BUF_SIZE, fp) == NULL) {
       if (feof(fp))
         break;
       goto file_malformed;
@@ -1248,7 +1253,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
     return 0;
   }
   hierarchy_path_inner = hierarchy_path + strlen(root);
-  snprintf(info->path, 4096, "%s/%s", mount_point, hierarchy_path_inner);
+  snprintf(info->path, CGROUPS_BUF_SIZE, "%s/%s", mount_point, hierarchy_path_inner);
   return 0;
 
 file_malformed:
@@ -1259,13 +1264,13 @@ file_malformed:
 
 
 static uint64_t uv__read_cgroups_uint64(const char* path, const char* param) {
-  char filename[256];
+  char filename[CGROUPS_BUF_SIZE];
   uint64_t rc;
   int fd;
   ssize_t n;
   char buf[32];  /* Large enough to hold an encoded uint64_t. */
 
-  snprintf(filename, 256, "%s/%s", path, param);
+  snprintf(filename, CGROUPS_BUF_SIZE, "%s/%s", path, param);
 
   rc = 0;
   fd = uv__open_cloexec(filename, O_RDONLY);
@@ -1305,12 +1310,14 @@ uint64_t uv_get_constrained_memory(void) {
    */
   if (CGROUPS_VERSION_1 == info.cgroups_version)
     return uv__read_cgroups_uint64(info.path, "memory.limit_in_bytes");
-  else if (CGROUPS_VERSION_2 == info.cgroups_version) {
+
+  if (CGROUPS_VERSION_2 == info.cgroups_version) {
     max = uv__read_cgroups_uint64(info.path, "memory.max");
     high = uv__read_cgroups_uint64(info.path, "memory.high");
     if (max == 0 || high == 0)
       return 0;
     return max > high ? max : high;
-  } else /* if (CGROUPS_VERSION_UNKNOWN == info.cgroups_version) */
-    return 0;
+  }
+
+  return 0;
 }
