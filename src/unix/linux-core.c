@@ -1036,64 +1036,26 @@ typedef struct {
 
 
 /*
- * Writes `start` to `field_start` and the length of the current
- * whitespace-delimited field to `field_len`, and returns an pointer to the
- * remainder of the string (excluding the whitespace).
- * Note that we assume that `start` ends with "\n\0".
+ * Given a `separator`-delimited string `haystack`, return 1 if `needle` exactly
+ * matches at least one of the elements in that sequence.
  */
-static const char* uv__mountinfo_next_field(const char* start,
-    const char** field_start, size_t* field_len) {
-  size_t len;
-  const char* field_end;
-  if ('\0' == *start)
+static int uv__find_in_delimited_string(const char* haystack, const char* needle, char separator) {
+  char* haystack_mutable;
+  char* candidate;
+  char* haystack_ptr;
+  if (needle == NULL || strlen(needle) > strlen(haystack))
     return 0;
-  field_end = strchr(start, ' ');
-  if (field_end == NULL) {
-    len = strlen(start) - 1; /* -1 to lop off newline */
-  } else {
-    len = field_end - start;
-  }
-  if (field_start != NULL) {
-    *field_start = start;
-  }
-  if (field_len != NULL) {
-    *field_len = len;
-  }
-  return start + len + 1;
-}
-
-
-/*
- * Given a comma-delimited sequence of strings `super_options` (w/ size
- * `super_options_len`), return TRUE if option exactly matches one of the
- * elements in that sequence.
- */
-static int uv__mountinfo_find_super_option(const char* super_options,
-    size_t super_options_len, const char* option) {
-  size_t option_len = strlen(option);
-  const char* low = super_options;
-  const char* high = super_options + super_options_len - option_len;
-  const char* preceding_char;
-  const char* succeeding_char;
-  while (strlen(low)) {
-    low = strstr(low, option);
-    if (low == NULL || low > high)
-      break;
-    preceding_char = low - 1;
-    succeeding_char = low + option_len;
-    if (low == super_options || ',' == *preceding_char) {
-      /*
-       * The occurrence of `option` is preceded by a comma, or is part of the
-       * first entry in `super_options`.
-       */
-      if (' ' == *succeeding_char || ',' == *succeeding_char || '\n' == *succeeding_char)
-        /*
-         * The occurrence of `option` is succeeded by a comma, or is part of the
-         * last entry in `super_options`.
-         */
-        return 1;
+  haystack_mutable = malloc(strlen(haystack) + 1);
+  strcpy(haystack_mutable, haystack);
+  haystack_ptr = haystack_mutable;
+  do {
+    candidate = strsep(&haystack_ptr, &separator);
+    if (!strcmp(candidate, needle)) {
+      free(haystack_mutable);
+      return 1;
     }
-  }
+  } while (haystack_ptr != NULL);
+  free(haystack_mutable);
   return 0;
 }
 
@@ -1111,10 +1073,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
    * See description of /proc/[pid]/mountinfo in proc(5).
    * Henceforth, numbers in parentheses refer to fields from the docs.
    */
-  const char* field_ptr;
-  const char* field_start[10];
-  size_t field_len[10];
-  size_t field_idx;
+  char* field_ptr;
   char root[CGROUPS_BUF_SIZE]; /* (4) */
   char mount_point[CGROUPS_BUF_SIZE]; /* (5) */
   /* From /proc/self/cgroup */
@@ -1138,34 +1097,34 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
    * Loop once per line; try to find the mount location for the given subsystem.
    */
   while (1) {
+    char* curr_root;
+    char* curr_mount_point;
+    char* curr_fs_type;
+    char* curr_super_options;
+
     if (fgets(buf, CGROUPS_BUF_SIZE, fp) == NULL) {
       if (feof(fp))
         break;
       goto file_malformed;
     }
+    /* fgets includes the newline at the end; remove it. */
+    if ('\n' == buf[strlen(buf) - 1])
+      buf[strlen(buf) - 1] = '\0';
     field_ptr = buf;
-    field_idx = 0;
-    /* Read fields (1) thru (6), assigning them to indices 0 thru 5. */
-    for (field_idx = 0; field_idx < 6; field_idx++) {
-      if (!field_ptr)
-        goto file_malformed;
-      field_ptr = uv__mountinfo_next_field(field_ptr, &field_start[field_idx], &field_len[field_idx]);
-    }
-    /* A hyphen (8) marks the end of variable-length optional fields (7). */
-    field_start[field_idx] = field_ptr;
-    field_len[field_idx] = 0; /* Not used. */
+    strsep(&field_ptr, " "); /* mount ID */
+    strsep(&field_ptr, " "); /* parent ID */
+    strsep(&field_ptr, " "); /* st_dev major:minor */
+    curr_root = strsep(&field_ptr, " ");
+    curr_mount_point = strsep(&field_ptr, " ");
+    strsep(&field_ptr, " "); /* mount options */
+    /* A hyphen marks the end of variable-length optional fields. */
     while ('-' != field_ptr[0]) {
-      if (!field_ptr)
-        goto file_malformed;
-      field_ptr = uv__mountinfo_next_field(field_ptr, NULL, NULL);
+      strsep(&field_ptr, " ");
     }
-    field_ptr = uv__mountinfo_next_field(field_ptr, NULL, NULL);
-    /* Read fields (9) thru (11), assigning them to indices 7 thru 9. */
-    for (field_idx = 7; field_idx < 10; field_idx++) {
-      if (!field_ptr)
-        goto file_malformed;
-      field_ptr = uv__mountinfo_next_field(field_ptr, &field_start[field_idx], &field_len[field_idx]);
-    }
+    strsep(&field_ptr, " "); /* separator (hyphen) */
+    curr_fs_type = strsep(&field_ptr, " ");
+    strsep(&field_ptr, " "); /* mount source */
+    curr_super_options = strsep(&field_ptr, " ");
     /*
      * If the fs type (9) is "cgroup" and super options (11) contains the name
      * of the subsystem, then we've found the correct mount location, so save
@@ -1175,26 +1134,23 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
      * because we don't know yet whether the input subsystem is controlled by
      * cgroups v1 or v2.
      */
-    if (!strncmp(field_start[7], "cgroup", strlen("cgroup"))) {
-      if (6 == field_len[7]) {
-        /* cgroups v1 */
-        if (uv__mountinfo_find_super_option(field_start[9], field_len[9], subsystem)) {
-          strncpy(root, field_start[3], field_len[3]);
-          root[field_len[3]] = '\0';
-          strncpy(mount_point, field_start[4], field_len[4]);
-          mount_point[field_len[4]] = '\0';
-          info->cgroups_version = CGROUPS_VERSION_1;
-          break;
-        }
-      } else if (7 == field_len[7] && '2' == field_start[7][6]) {
-        /* cgroups v2 */
-        strncpy(root, field_start[3], field_len[3]);
-        root[field_len[3]] = '\0';
-        strncpy(mount_point, field_start[4], field_len[4]);
-        mount_point[field_len[4]] = '\0';
-        info->cgroups_version = CGROUPS_VERSION_2;
-        /* But don't break. */
+    if (!strcmp(curr_fs_type, "cgroup")) {
+      /* cgroups v1 */
+      if (uv__find_in_delimited_string(curr_super_options, subsystem, ',')) {
+        strcpy(root, curr_root);
+        strcpy(mount_point, curr_mount_point);
+        info->cgroups_version = CGROUPS_VERSION_1;
+        break;
       }
+    } else if (!strcmp(curr_fs_type, "cgroup2")) {
+      /* cgroups v2 */
+      strcpy(root, curr_root);
+      strcpy(mount_point, curr_mount_point);
+      info->cgroups_version = CGROUPS_VERSION_2;
+      /*
+        * Don't break, as we're not certain that this subsystem is controlled
+        * by cgroups v2.
+        */
     }
   }
 
@@ -1302,7 +1258,6 @@ uint64_t uv_get_constrained_memory(void) {
 
   if (uv__read_cgroups_proc_files(&info, "memory"))
     return 0;
-
   /*
    * This might return 0 if there was a problem getting the memory limit from
    * cgroups. This is OK because a return value of 0 signifies that the memory
