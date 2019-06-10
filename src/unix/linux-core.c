@@ -1078,11 +1078,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   char mount_point[CGROUPS_BUF_SIZE]; /* (5) */
   /* From /proc/self/cgroup */
   char hierarchy_path[CGROUPS_BUF_SIZE];
-  /*
-   * Should be big enough to fit a subsystem name, plus 2 more characters.
-   * The longest known subsystem name (from cgroups docs) is "perf_event".
-   */
-  char subsystem_search_string[16];
+  char* subsystem_search_string = NULL;
   const char* subsystem_search_ptr;
   const char* hierarchy_path_inner;
 
@@ -1172,6 +1168,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
     return UV__ERR(errno);
   
   /* + 3 for two colons, and terminal character. */
+  subsystem_search_string = malloc(strlen(subsystem) + 3);
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
   while (1) {
@@ -1199,6 +1196,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   }
 
   fclose(fp);
+  free(subsystem_search_string);
 
   /*
    * The hierarchy path should be prefixed with the root path from mountinfo,
@@ -1215,6 +1213,8 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 file_malformed:
   fclose(fp);
   info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+  if (subsystem_search_string != NULL)
+    free(subsystem_search_string);
   return UV_EIO;
 }
 
