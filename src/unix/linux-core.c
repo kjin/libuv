@@ -1269,9 +1269,13 @@ uint64_t uv_get_constrained_memory(void) {
   if (CGROUPS_VERSION_2 == info.cgroups_version) {
     max = uv__read_cgroups_uint64(info.path, "memory.max");
     high = uv__read_cgroups_uint64(info.path, "memory.high");
-    if (max == 0 || high == 0)
+    if (max == 0 && high == 0)
       return 0;
-    return max > high ? max : high;
+    else if (max == 0)
+      return high;
+    else if (high == 0)
+      return max;
+    return max < high ? max : high;
   }
 
   return 0;
