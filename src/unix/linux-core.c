@@ -1027,11 +1027,14 @@ uint64_t uv_get_total_memory(void) {
 #define CGROUPS_BUF_SIZE 4096
 
 
+/*
+ * Holds information about a given cgroups subsystem.
+ */
 typedef struct {
   /* cgroups version, one of CGROUPS_VERSION_*. */
   uint8_t cgroups_version;
   /* Path in which param files are found for a subsystem. */
-  char path[CGROUPS_BUF_SIZE];
+  char* path;
 } uv__cgroups_subsystem_info_t;
 
 
@@ -1064,6 +1067,10 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
  * Read /proc/self/mountinfo and /proc/self/cgroup to get info about how the
  * given subsystem is controlled for this process, and the path to the
  * subsystem's parameter files, if possible.
+ * 
+ * If info->cgroups_version == CGROUPS_VERSION_UNKNOWN, info->path will be NULL.
+ * Otherwise, info->path will be a heap pointer and the caller is responsible
+ * for freeing it.
  */
 static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const char* subsystem) {
   FILE* fp;
@@ -1079,10 +1086,9 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   /* From /proc/self/cgroup */
   char hierarchy_path[CGROUPS_BUF_SIZE];
   char* subsystem_search_string = NULL;
-  const char* subsystem_search_ptr;
-  const char* hierarchy_path_inner;
 
   info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+  info->path = NULL;
 
   /* Read /proc/self/mountinfo to get controller path. */
 
@@ -1172,26 +1178,27 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
   while (1) {
+    const char* hierarchy_path_search_ptr;
     if (fgets(buf, CGROUPS_BUF_SIZE, fp) == NULL) {
       if (feof(fp))
         break;
       goto file_malformed;
     }
     if (CGROUPS_VERSION_1 == info->cgroups_version) {
-      subsystem_search_ptr = strstr(buf, subsystem_search_string);
-      if (subsystem_search_ptr) {
-        strncpy(hierarchy_path,
-            subsystem_search_ptr + strlen(subsystem_search_string),
-            strlen(subsystem_search_ptr) - strlen(subsystem_search_string) - 1);
-        break;
+      hierarchy_path_search_ptr = strstr(buf, subsystem_search_string);
+      if (hierarchy_path_search_ptr) {
+        hierarchy_path_search_ptr += strlen(subsystem_search_string);
       }
     } else { /* if (CGROUPS_VERSION_2 == info->cgroups_version) */
-      if (!strncmp(buf, CGROUPS_V2_CTRL_PREFIX, CGROUPS_V2_CTRL_PREFIX_LEN)) {
-        /* - 1 to remove newline. */
-        strncpy(hierarchy_path, buf + CGROUPS_V2_CTRL_PREFIX_LEN,
-            strlen(buf) - CGROUPS_V2_CTRL_PREFIX_LEN - 1);
-        break;
-      }
+      if (!strncmp(buf, CGROUPS_V2_CTRL_PREFIX, CGROUPS_V2_CTRL_PREFIX_LEN))
+        hierarchy_path_search_ptr = buf + CGROUPS_V2_CTRL_PREFIX_LEN;
+    }
+    if (hierarchy_path_search_ptr) {
+      /* -1 because buf includes the trailing newline. */
+      strncpy(hierarchy_path, hierarchy_path_search_ptr,
+        strlen(hierarchy_path_search_ptr) - 1);
+      hierarchy_path[strlen(hierarchy_path_search_ptr) - 1] = '\0';
+      break;
     }
   }
 
@@ -1202,12 +1209,17 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
    * The hierarchy path should be prefixed with the root path from mountinfo,
    * and should be replaced with the mount point.
    */
-  if (strncmp(hierarchy_path, root, strlen(root))) {
+  if (!strncmp(hierarchy_path, root, strlen(root))) {
+    const char* hierarchy_path_inner;
+    size_t path_size;
+    hierarchy_path_inner = hierarchy_path + strlen(root);
+    /* +2 for "/" and null terminator. */
+    path_size = strlen(mount_point) + strlen(hierarchy_path_inner) + 2;
+    printf(">>> root=%s, hierarchy_path=%s, mount_point=%s\n", root, hierarchy_path, mount_point);
+    info->path = malloc(path_size);
+    snprintf(info->path, path_size, "%s/%s", mount_point, hierarchy_path_inner);
+  } else
     info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
-    return 0;
-  }
-  hierarchy_path_inner = hierarchy_path + strlen(root);
-  snprintf(info->path, CGROUPS_BUF_SIZE, "%s/%s", mount_point, hierarchy_path_inner);
   return 0;
 
 file_malformed:
@@ -1253,30 +1265,39 @@ static uint64_t uv__read_cgroups_uint64(const char* path, const char* param) {
 
 uint64_t uv_get_constrained_memory(void) {
   uv__cgroups_subsystem_info_t info;
+  uint64_t rc;
   /* For v2 only. */
   uint64_t max, high;
 
-  if (uv__read_cgroups_proc_files(&info, "memory"))
-    return 0;
-  /*
-   * This might return 0 if there was a problem getting the memory limit from
-   * cgroups. This is OK because a return value of 0 signifies that the memory
-   * limit is unknown.
-   */
-  if (CGROUPS_VERSION_1 == info.cgroups_version)
-    return uv__read_cgroups_uint64(info.path, "memory.limit_in_bytes");
+  rc = 0;
 
-  if (CGROUPS_VERSION_2 == info.cgroups_version) {
-    max = uv__read_cgroups_uint64(info.path, "memory.max");
-    high = uv__read_cgroups_uint64(info.path, "memory.high");
-    if (max == 0 && high == 0)
-      return 0;
-    else if (max == 0)
-      return high;
-    else if (high == 0)
-      return max;
-    return max < high ? max : high;
+  if (!uv__read_cgroups_proc_files(&info, "memory")) {
+    /*
+     * uv__read_cgroups_uint64 might return 0 if there was a problem getting the
+     * memory limit from cgroups. This is OK because a return value of 0
+     * signifies that the memory limit is unknown.
+     */
+
+    if (CGROUPS_VERSION_1 == info.cgroups_version)
+      rc = uv__read_cgroups_uint64(info.path, "memory.limit_in_bytes");
+
+    if (CGROUPS_VERSION_2 == info.cgroups_version) {
+      max = uv__read_cgroups_uint64(info.path, "memory.max");
+      high = uv__read_cgroups_uint64(info.path, "memory.high");
+      if (max == 0 && high == 0)
+        rc = 0;
+      else if (max == 0)
+        rc = high;
+      else if (high == 0)
+        rc = max;
+      else
+        rc = max < high ? max : high;
+    }
+
+    if (NULL != info.path) {
+      free(info.path);
+    }
   }
 
-  return 0;
+  return rc;
 }
