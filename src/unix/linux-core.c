@@ -1074,17 +1074,15 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
  */
 static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const char* subsystem) {
   FILE* fp;
-  /* Should be big enough to fit a single line. */
-  char buf[CGROUPS_BUF_SIZE];
   /*
    * See description of /proc/[pid]/mountinfo in proc(5).
    * Henceforth, numbers in parentheses refer to fields from the docs.
    */
   char* field_ptr;
-  char root[CGROUPS_BUF_SIZE]; /* (4) */
-  char mount_point[CGROUPS_BUF_SIZE]; /* (5) */
+  char root[PATH_MAX]; /* (4) */
+  char mount_point[PATH_MAX]; /* (5) */
   /* From /proc/self/cgroup */
-  char hierarchy_path[CGROUPS_BUF_SIZE];
+  char hierarchy_path[PATH_MAX];
   char* subsystem_search_string = NULL;
 
   info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
@@ -1099,6 +1097,8 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
    * Loop once per line; try to find the mount location for the given subsystem.
    */
   while (1) {
+    /* Should be big enough to fit a single line. */
+    char buf[CGROUPS_BUF_SIZE];
     char* curr_root;
     char* curr_mount_point;
     char* curr_fs_type;
@@ -1178,6 +1178,8 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
   while (1) {
+    /* Should be big enough to fit a single line. */
+    char buf[CGROUPS_BUF_SIZE];
     const char* hierarchy_path_search_ptr;
     if (fgets(buf, CGROUPS_BUF_SIZE, fp) == NULL) {
       if (feof(fp))
@@ -1231,13 +1233,13 @@ file_malformed:
 
 
 static uint64_t uv__read_cgroups_uint64(const char* path, const char* param) {
-  char filename[CGROUPS_BUF_SIZE];
+  char filename[PATH_MAX];
   uint64_t rc;
   int fd;
   ssize_t n;
   char buf[32];  /* Large enough to hold an encoded uint64_t. */
 
-  snprintf(filename, CGROUPS_BUF_SIZE, "%s/%s", path, param);
+  snprintf(filename, PATH_MAX, "%s/%s", path, param);
 
   rc = 0;
   fd = uv__open_cloexec(filename, O_RDONLY);
