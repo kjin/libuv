@@ -39,7 +39,6 @@
 #include <sys/param.h>
 #include <sys/prctl.h>
 #include <sys/sysinfo.h>
-#include <sys/vfs.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -1024,7 +1023,6 @@ uint64_t uv_get_total_memory(void) {
 #define CGROUPS_V2_CTRL_PREFIX "0::"
 #define CGROUPS_V2_CTRL_PREFIX_LEN 3
 #define CGROUPS_V2_NO_LIMIT_VALUE "max"
-#define CGROUPS_BUF_SIZE 16384
 
 
 /*
@@ -1063,35 +1061,6 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
 }
 
 
-/**
- * Reads a line from `fp` into `buf`. (A line ends in \n or EOF.) The trailing
- * newline will be replaced with a \0 if it exists.
- *
- * If a line exceeds `buf_size`, `buf` will contain the first `buf_size`
- * characters, and `fp` will be positioned at the beginning of the next line,
- * instead of offset-`buf_size` into the current line (in other words anything
- * after the first `buf_size` characters will be lost).
- *
- * Returns 0 if the entire line is read into `buf`, a positive number if it was
- * truncated, and UV_EIO if reading the file using fgets returns NULL.
- */
-static int uv__read_line(char* buf, size_t buf_size, FILE* fp) {
-  if (NULL == fgets(buf, CGROUPS_BUF_SIZE, fp)) {
-    return UV_EIO;
-  }
-  if ('\n' != buf[strlen(buf) - 1]) {
-    /* We know here that `buf` doesn't end in a newline. */
-    /* Scan to the beginning of the next line. */
-    fscanf(fp, "%*[^\n]");
-    fscanf(fp, "%*[\n]");
-    return 1;
-  }
-  /* Remove the newline at the end. */
-  buf[strlen(buf) - 1] = '\0';
-  return 0;
-}
-
-
 /*
  * Read /proc/self/mountinfo and /proc/self/cgroup to get info about how the
  * given subsystem is controlled for this process, and the path to the
@@ -1103,13 +1072,13 @@ static int uv__read_line(char* buf, size_t buf_size, FILE* fp) {
  */
 static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const char* subsystem) {
   FILE* fp;
-  /*
-   * See description of /proc/[pid]/mountinfo in proc(5).
-   * Henceforth, numbers in parentheses refer to fields from the docs.
-   */
-  char* field_ptr;
-  char root[PATH_MAX]; /* (4) */
-  char mount_point[PATH_MAX]; /* (5) */
+  /* Buffer to be dynamically (re-)sized by getline(). */
+  char* buf = NULL;
+  size_t buf_size = 0;
+
+  /* From /proc/self/mountinfo */
+  char root[PATH_MAX];
+  char mount_point[PATH_MAX];
   /* From /proc/self/cgroup */
   char hierarchy_path[PATH_MAX];
   char* subsystem_search_string = NULL;
@@ -1125,32 +1094,19 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   /*
    * Loop once per line; try to find the mount location for the given subsystem.
    */
-  while (1) {
-    /* Should be big enough to fit a single line. */
-    char buf[CGROUPS_BUF_SIZE];
-    int read_line_rc;
+  while (!feof(fp)) {
+    char* field_ptr;
     char* curr_root;
     char* curr_mount_point;
     char* curr_fs_type;
     char* curr_super_options;
-
-    read_line_rc = uv__read_line(buf, CGROUPS_BUF_SIZE, fp);
-    if (read_line_rc > 0) {
-      /*
-       * Treat a truncated line as invalid.
-       * cgroup-relevant mountinfo entries should already be well under 12KB
-       * in length.
-       */
-      continue;
-    } else if (read_line_rc < 0) {
-      /*
-       * Note that feof(fp) will evaluate to true immediately after the last
-       * line is read, but read_line_rc will be zero.
-       */
+    if (getline(&buf, &buf_size, fp) < 0) {
       if (feof(fp))
         break;
       goto file_malformed;
     }
+    if ('\n' == buf[strlen(buf) - 1])
+      buf[strlen(buf) - 1] = '\0';
 
     field_ptr = buf;
     strsep(&field_ptr, " "); /* mount ID */
@@ -1197,6 +1153,9 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   }
 
   fclose(fp);
+  if (NULL != buf)
+    free(buf);
+  buf_size = 0;
 
   /*
    * If cgroups version wasn't determined, assume this subsystem isn't enabled
@@ -1217,28 +1176,16 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   subsystem_search_string = malloc(strlen(subsystem) + 3);
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
-  while (1) {
-    /* Should be big enough to fit a single line. */
-    char buf[CGROUPS_BUF_SIZE];
-    int read_line_rc;
+  while (!feof(fp)) {
     const char* hierarchy_path_search_ptr;
 
-    read_line_rc = uv__read_line(buf, CGROUPS_BUF_SIZE, fp);
-    if (read_line_rc > 0) {
-      /*
-       * Treat a truncated line as invalid.
-       * Lines in this file shouldn't be much more than ~4KB.
-       */
-      continue;
-    } else if (read_line_rc < 0) {
-      /*
-       * Note that feof(fp) will evaluate to true immediately after the last
-       * line is read, but read_line_rc will be zero.
-       */
+    if (getline(&buf, &buf_size, fp) < 0) {
       if (feof(fp))
         break;
       goto file_malformed;
     }
+    if ('\n' == buf[strlen(buf) - 1])
+      buf[strlen(buf) - 1] = '\0';
 
     if (CGROUPS_VERSION_1 == info->cgroups_version) {
       hierarchy_path_search_ptr = strstr(buf, subsystem_search_string);
@@ -1257,6 +1204,8 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 
   fclose(fp);
   free(subsystem_search_string);
+  if (NULL != buf)
+    free(buf);
 
   /*
    * The hierarchy path should be prefixed with the root path from mountinfo,
@@ -1276,6 +1225,8 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 
 file_malformed:
   fclose(fp);
+  if (NULL != buf)
+    free(buf);
   info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
   if (subsystem_search_string != NULL)
     free(subsystem_search_string);
