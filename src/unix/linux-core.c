@@ -1024,7 +1024,7 @@ uint64_t uv_get_total_memory(void) {
 #define CGROUPS_V2_CTRL_PREFIX "0::"
 #define CGROUPS_V2_CTRL_PREFIX_LEN 3
 #define CGROUPS_V2_NO_LIMIT_VALUE "max"
-#define CGROUPS_BUF_SIZE 4096
+#define CGROUPS_BUF_SIZE 16384
 
 
 /*
@@ -1059,6 +1059,35 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
     }
   } while (haystack_ptr != NULL);
   free(haystack_mutable);
+  return 0;
+}
+
+
+/**
+ * Reads a line from `fp` into `buf`. (A line ends in \n or EOF.) The trailing
+ * newline will be replaced with a \0 if it exists.
+ *
+ * If a line exceeds `buf_size`, `buf` will contain the first `buf_size`
+ * characters, and `fp` will be positioned at the beginning of the next line,
+ * instead of offset-`buf_size` into the current line (in other words anything
+ * after the first `buf_size` characters will be lost).
+ *
+ * Returns 0 if the entire line is read into `buf`, a positive number if it was
+ * truncated, and UV_EIO if reading the file using fgets returns NULL.
+ */
+static int uv__read_line(char* buf, size_t buf_size, FILE* fp) {
+  if (NULL == fgets(buf, CGROUPS_BUF_SIZE, fp)) {
+    return UV_EIO;
+  }
+  if ('\n' != buf[strlen(buf) - 1]) {
+    /* We know here that `buf` doesn't end in a newline. */
+    /* Scan to the beginning of the next line. */
+    fscanf(fp, "%*[^\n]");
+    fscanf(fp, "%*[\n]");
+    return 1;
+  }
+  /* Remove the newline at the end. */
+  buf[strlen(buf) - 1] = '\0';
   return 0;
 }
 
@@ -1099,19 +1128,30 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   while (1) {
     /* Should be big enough to fit a single line. */
     char buf[CGROUPS_BUF_SIZE];
+    int read_line_rc;
     char* curr_root;
     char* curr_mount_point;
     char* curr_fs_type;
     char* curr_super_options;
 
-    if (fgets(buf, CGROUPS_BUF_SIZE, fp) == NULL) {
+    read_line_rc = uv__read_line(buf, CGROUPS_BUF_SIZE, fp);
+    if (read_line_rc > 0) {
+      /*
+       * Treat a truncated line as invalid.
+       * cgroup-relevant mountinfo entries should already be well under 12KB
+       * in length.
+       */
+      continue;
+    } else if (read_line_rc < 0) {
+      /*
+       * Note that feof(fp) will evaluate to true immediately after the last
+       * line is read, but read_line_rc will be zero.
+       */
       if (feof(fp))
         break;
       goto file_malformed;
     }
-    /* fgets includes the newline at the end; remove it. */
-    if ('\n' == buf[strlen(buf) - 1])
-      buf[strlen(buf) - 1] = '\0';
+
     field_ptr = buf;
     strsep(&field_ptr, " "); /* mount ID */
     strsep(&field_ptr, " "); /* parent ID */
@@ -1180,12 +1220,26 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   while (1) {
     /* Should be big enough to fit a single line. */
     char buf[CGROUPS_BUF_SIZE];
+    int read_line_rc;
     const char* hierarchy_path_search_ptr;
-    if (fgets(buf, CGROUPS_BUF_SIZE, fp) == NULL) {
+
+    read_line_rc = uv__read_line(buf, CGROUPS_BUF_SIZE, fp);
+    if (read_line_rc > 0) {
+      /*
+       * Treat a truncated line as invalid.
+       * Lines in this file shouldn't be much more than ~4KB.
+       */
+      continue;
+    } else if (read_line_rc < 0) {
+      /*
+       * Note that feof(fp) will evaluate to true immediately after the last
+       * line is read, but read_line_rc will be zero.
+       */
       if (feof(fp))
         break;
       goto file_malformed;
     }
+
     if (CGROUPS_VERSION_1 == info->cgroups_version) {
       hierarchy_path_search_ptr = strstr(buf, subsystem_search_string);
       if (hierarchy_path_search_ptr) {
@@ -1196,10 +1250,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
         hierarchy_path_search_ptr = buf + CGROUPS_V2_CTRL_PREFIX_LEN;
     }
     if (hierarchy_path_search_ptr) {
-      /* -1 because buf includes the trailing newline. */
-      strncpy(hierarchy_path, hierarchy_path_search_ptr,
-        strlen(hierarchy_path_search_ptr) - 1);
-      hierarchy_path[strlen(hierarchy_path_search_ptr) - 1] = '\0';
+      strcpy(hierarchy_path, hierarchy_path_search_ptr);
       break;
     }
   }
