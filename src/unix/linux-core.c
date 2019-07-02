@@ -1042,7 +1042,7 @@ typedef struct {
  * Given a `separator`-delimited string `haystack`, return 1 if `needle` exactly
  * matches at least one of the elements in that sequence.
  */
-static int uv__find_in_delimited_string(const char* haystack, const char* needle, char separator) {
+static int uv__find_in_delimited_string(const char* haystack, const char* needle, const char* separator) {
   char* haystack_mutable;
   char* candidate;
   char* haystack_ptr;
@@ -1052,7 +1052,7 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
   strcpy(haystack_mutable, haystack);
   haystack_ptr = haystack_mutable;
   do {
-    candidate = strsep(&haystack_ptr, &separator);
+    candidate = strsep(&haystack_ptr, separator);
     if (!strcmp(candidate, needle)) {
       free(haystack_mutable);
       return 1;
@@ -1178,7 +1178,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
      */
     if (!strcmp(curr_fs_type, "cgroup")) {
       /* cgroups v1 */
-      if (uv__find_in_delimited_string(curr_super_options, subsystem, ',')) {
+      if (uv__find_in_delimited_string(curr_super_options, subsystem, ",")) {
         strcpy(root, curr_root);
         strcpy(mount_point, curr_mount_point);
         info->cgroups_version = CGROUPS_VERSION_1;
