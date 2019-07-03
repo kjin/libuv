@@ -39,7 +39,6 @@
 #include <sys/param.h>
 #include <sys/prctl.h>
 #include <sys/sysinfo.h>
-#include <sys/vfs.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -1101,8 +1100,9 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
     char* curr_mount_point;
     char* curr_fs_type;
     char* curr_super_options;
-
-    if (!getline(&buf, &buf_size, fp)) {
+    if (getline(&buf, &buf_size, fp) < 0) {
+      if (feof(fp))
+        break;
       goto file_malformed;
     }
     if ('\n' == buf[strlen(buf) - 1])
@@ -1179,7 +1179,9 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   while (!feof(fp)) {
     const char* hierarchy_path_search_ptr;
 
-    if (!getline(&buf, &buf_size, fp)) {
+    if (getline(&buf, &buf_size, fp) < 0) {
+      if (feof(fp))
+        break;
       goto file_malformed;
     }
     if ('\n' == buf[strlen(buf) - 1])
