@@ -1042,14 +1042,14 @@ typedef struct {
  */
 static int uv__find_in_delimited_string(const char* haystack, const char* needle, const char* separator) {
   char* haystack_mutable;
-  size_t haystack_len;
+  size_t haystack_size;
   char* candidate;
   char* haystack_ptr;
-  haystack_len = strlen(haystack);
-  if (needle == NULL || strlen(needle) > haystack_len)
+  haystack_size = strlen(haystack) + 1;
+  if (needle == NULL || strlen(needle) >= haystack_size)
     return 0;
-  haystack_mutable = malloc(haystack_len + 1);
-  uv__strscpy(haystack_mutable, haystack, haystack_len + 1);
+  haystack_mutable = malloc(haystack_size);
+  uv__strscpy(haystack_mutable, haystack, haystack_size);
   haystack_ptr = haystack_mutable;
   do {
     candidate = strsep(&haystack_ptr, separator);
@@ -1084,7 +1084,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   /* From /proc/self/cgroup */
   char hierarchy_path[PATH_MAX];
 
-  /* Values used when reading /proc/self/cgroup */
+  /* Values used when reading /proc/self/mountinfo */
   char* field_ptr;
   char* curr_root;
   char* curr_mount_point;
@@ -1092,6 +1092,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   char* curr_super_options;
   /* Values used when reading /proc/self/cgroup */
   const char* hierarchy_path_search_ptr;
+  const char* hierarchy_path_inner;
   char* subsystem_search_string;
 
   buf = NULL;
@@ -1109,9 +1110,9 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   /*
    * Loop once per line; try to find the mount location for the given subsystem.
    */
-  while (!feof(fp)) {
+  while (feof(fp) == 0) {
     if (getline(&buf, &buf_size, fp) < 0) {
-      if (feof(fp))
+      if (feof(fp) != 0)
         break;
       goto file_malformed;
     }
@@ -1143,7 +1144,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
      */
     if (strcmp(curr_fs_type, "cgroup") == 0) {
       /* cgroups v1 */
-      if (uv__find_in_delimited_string(curr_super_options, subsystem, ",")) {
+      if (uv__find_in_delimited_string(curr_super_options, subsystem, ",") != 0) {
         uv__strscpy(root, curr_root, sizeof(root));
         uv__strscpy(mount_point, curr_mount_point, sizeof(mount_point));
         info->cgroups_version = CGROUPS_VERSION_1;
@@ -1162,8 +1163,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   }
 
   fclose(fp);
-  if (NULL != buf)
-    free(buf);
+  free(buf);
   buf_size = 0;
 
   /*
@@ -1185,9 +1185,9 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   subsystem_search_string = malloc(strlen(subsystem) + 3);
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
-  while (!feof(fp)) {
+  while (feof(fp) == 0) {
     if (getline(&buf, &buf_size, fp) < 0) {
-      if (feof(fp))
+      if (feof(fp) != 0)
         break;
       goto file_malformed;
     }
@@ -1196,30 +1196,27 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 
     if (CGROUPS_VERSION_1 == info->cgroups_version) {
       hierarchy_path_search_ptr = strstr(buf, subsystem_search_string);
-      if (hierarchy_path_search_ptr) {
+      if (hierarchy_path_search_ptr)
         hierarchy_path_search_ptr += strlen(subsystem_search_string);
-      }
     } else { /* if (CGROUPS_VERSION_2 == info->cgroups_version) */
       if (strncmp(buf, CGROUPS_V2_CTRL_PREFIX, CGROUPS_V2_CTRL_PREFIX_LEN) == 0)
         hierarchy_path_search_ptr = buf + CGROUPS_V2_CTRL_PREFIX_LEN;
     }
-    if (hierarchy_path_search_ptr) {
+    if (hierarchy_path_search_ptr != NULL) {
       uv__strscpy(hierarchy_path, hierarchy_path_search_ptr, sizeof(hierarchy_path));
       break;
     }
   }
 
   fclose(fp);
+  free(buf);
   free(subsystem_search_string);
-  if (NULL != buf)
-    free(buf);
 
   /*
    * The hierarchy path should be prefixed with the root path from mountinfo,
    * and should be replaced with the mount point.
    */
   if (strncmp(hierarchy_path, root, strlen(root)) == 0) {
-    const char* hierarchy_path_inner;
     size_t path_size;
     hierarchy_path_inner = hierarchy_path + strlen(root);
     /* +2 for "/" and null terminator. */
@@ -1233,11 +1230,9 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 
 file_malformed:
   fclose(fp);
-  if (NULL != buf)
-    free(buf);
+  free(buf);
+  free(subsystem_search_string);
   info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
-  if (subsystem_search_string != NULL)
-    free(subsystem_search_string);
   return UV_EIO;
 }
 
@@ -1281,7 +1276,7 @@ uint64_t uv_get_constrained_memory(void) {
 
   rc = 0;
 
-  if (!uv__read_cgroups_proc_files(&info, "memory")) {
+  if (uv__read_cgroups_proc_files(&info, "memory") == 0) {
     /*
      * uv__read_cgroups_uint64 might return 0 if there was a problem getting the
      * memory limit from cgroups. This is OK because a return value of 0
@@ -1301,8 +1296,7 @@ uint64_t uv_get_constrained_memory(void) {
         rc = max < high ? max : high;
     }
 
-    if (NULL != info.path)
-      free(info.path);
+    free(info.path);
   }
 
   return rc;
