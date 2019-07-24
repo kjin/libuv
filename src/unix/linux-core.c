@@ -1048,17 +1048,17 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
   haystack_size = strlen(haystack) + 1;
   if (needle == NULL || strlen(needle) >= haystack_size)
     return 0;
-  haystack_mutable = malloc(haystack_size);
+  haystack_mutable = uv__malloc(haystack_size);
   uv__strscpy(haystack_mutable, haystack, haystack_size);
   haystack_ptr = haystack_mutable;
   do {
     candidate = strsep(&haystack_ptr, separator);
     if (strcmp(candidate, needle) == 0) {
-      free(haystack_mutable);
+      uv__free(haystack_mutable);
       return 1;
     }
   } while (haystack_ptr != NULL);
-  free(haystack_mutable);
+  uv__free(haystack_mutable);
   return 0;
 }
 
@@ -1071,6 +1071,43 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
  * If info->cgroups_version == CGROUPS_VERSION_UNKNOWN, info->path will be NULL.
  * Otherwise, info->path will be a heap pointer and the caller is responsible
  * for freeing it.
+ * 
+ * == cgroups v1 example ==
+ * 
+ * /proc/self/mountinfo:
+ * ...
+ * 490 486 0:31 /docker/8b1b53f /sys/fs/cgroup/blkio ro master:21 - cgroup blkio rw,blkio
+ * 491 486 0:32 /docker/8b1b53f /sys/fs/cgroup/memory ro master:22 - cgroup memory rw,memory
+ * 492 486 0:33 /docker/8b1b53f /sys/fs/cgroup/devices ro master:23 - cgroup devices rw,devices
+ * ...
+ * 
+ * /proc/self/cgroup
+ * ...
+ * 6:devices:/docker/8b1b53f/foo-slice
+ * 5:memory:/docker/8b1b53f/foo-slice
+ * 4:blkio:/docker/8b1b53f/foo-slice
+ * ...
+ * 
+ * If we are looking for the path to the memory parameter files, we substitute
+ * the portion of the path corresponding to "memory" in /proc/self/cgroup that
+ * matches the root in /proc/self/mountinfo (/docker/8b1b53f) with the mount
+ * point (/sys/fs/cgroup/memory), resulting in the path
+ * /sys/fs/cgroup/memory/foo-slice.
+ * 
+ * == cgroups v2 example ==
+ * 
+ * /proc/self/mountinfo:
+ * ...
+ * 26 17 0:22 / /sys/fs/cgroup rw shared:9 - cgroup2 cgroup rw
+ * ...
+ * 
+ * /proc/self/cgroup (in entirety):
+ * 0::/foo-slice
+ * 
+ * If we are looking for the path to the memory parameter files, we substitute
+ * the portion of the path in the only entry in /proc/self/cgroup that matches
+ * the root (/) with the mount point (/sys/fs/cgroup), resulting in the path
+ * /sys/fs/cgroup/foo-slice.
  */
 static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const char* subsystem) {
   FILE* fp;
@@ -1079,10 +1116,10 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   size_t buf_size;
 
   /* From /proc/self/mountinfo */
-  char root[PATH_MAX];
-  char mount_point[PATH_MAX];
+  char root[UV__PATH_MAX];
+  char mount_point[UV__PATH_MAX];
   /* From /proc/self/cgroup */
-  char hierarchy_path[PATH_MAX];
+  char hierarchy_path[UV__PATH_MAX];
 
   /* Values used when reading /proc/self/mountinfo */
   char* field_ptr;
@@ -1163,7 +1200,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   }
 
   fclose(fp);
-  free(buf);
+  uv__free(buf);
   buf_size = 0;
 
   /*
@@ -1182,7 +1219,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
     return UV__ERR(errno);
   
   /* + 3 for two colons, and terminal character. */
-  subsystem_search_string = malloc(strlen(subsystem) + 3);
+  subsystem_search_string = uv__malloc(strlen(subsystem) + 3);
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
   while (feof(fp) == 0) {
@@ -1209,8 +1246,8 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   }
 
   fclose(fp);
-  free(buf);
-  free(subsystem_search_string);
+  uv__free(buf);
+  uv__free(subsystem_search_string);
 
   /*
    * The hierarchy path should be prefixed with the root path from mountinfo,
@@ -1221,7 +1258,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
     hierarchy_path_inner = hierarchy_path + strlen(root);
     /* +2 for "/" and null terminator. */
     path_size = strlen(mount_point) + strlen(hierarchy_path_inner) + 2;
-    info->path = malloc(path_size);
+    info->path = uv__malloc(path_size);
     snprintf(info->path, path_size, "%s/%s", mount_point, hierarchy_path_inner);
   } else {
     info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
@@ -1230,15 +1267,15 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 
 file_malformed:
   fclose(fp);
-  free(buf);
-  free(subsystem_search_string);
+  uv__free(buf);
+  uv__free(subsystem_search_string);
   info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
   return UV_EIO;
 }
 
 
 static uint64_t uv__read_cgroups_uint64(const char* path, const char* param) {
-  char filename[PATH_MAX];
+  char filename[UV__PATH_MAX];
   uint64_t rc;
   int fd;
   ssize_t n;
@@ -1296,7 +1333,7 @@ uint64_t uv_get_constrained_memory(void) {
         rc = max < high ? max : high;
     }
 
-    free(info.path);
+    uv__free(info.path);
   }
 
   return rc;
