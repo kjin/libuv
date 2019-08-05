@@ -1042,14 +1042,13 @@ typedef struct {
  */
 static int uv__find_in_delimited_string(const char* haystack, const char* needle, const char* separator) {
   char* haystack_mutable;
-  size_t haystack_size;
+  size_t haystack_len;
   char* candidate;
   char* haystack_ptr;
-  haystack_size = strlen(haystack) + 1;
-  if (needle == NULL || strlen(needle) >= haystack_size)
+  haystack_len = strlen(haystack);
+  if (needle == NULL || strlen(needle) > haystack_len)
     return 0;
-  haystack_mutable = uv__malloc(haystack_size);
-  uv__strscpy(haystack_mutable, haystack, haystack_size);
+  haystack_mutable = uv__strndup(haystack, haystack_len);
   haystack_ptr = haystack_mutable;
   do {
     candidate = strsep(&haystack_ptr, separator);
