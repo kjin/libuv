@@ -81,9 +81,6 @@
 #define CGROUPS_VERSION_UNKNOWN 0x0
 #define CGROUPS_VERSION_1 0x1
 #define CGROUPS_VERSION_2 0x2
-#define CGROUPS_V2_CTRL_PREFIX "0::"
-#define CGROUPS_V2_CTRL_PREFIX_LEN 3
-#define CGROUPS_V2_NO_LIMIT_VALUE "max"
 
 static int read_models(unsigned int numcpus, uv_cpu_info_t* ci);
 static int read_times(FILE* statfile_fp,
@@ -1038,9 +1035,12 @@ typedef struct {
 
 /*
  * Given a `separator`-delimited string `haystack`, return 1 if `needle` exactly
- * matches at least one of the elements in that sequence.
+ * matches at least one of the elements in that sequence, 0 if this is not the
+ * case or an error occurred (due to invalid inputs or OOM).
  */
-static int uv__find_in_delimited_string(const char* haystack, const char* needle, const char* separator) {
+static int uv__find_in_delimited_string(const char* haystack,
+                                        const char* needle,
+                                        const char* separator) {
   char* haystack_mutable;
   size_t haystack_len;
   char* candidate;
@@ -1049,6 +1049,8 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
   if (needle == NULL || strlen(needle) > haystack_len)
     return 0;
   haystack_mutable = uv__strndup(haystack, haystack_len);
+  if (haystack_mutable == NULL)
+    return 0;
   haystack_ptr = haystack_mutable;
   do {
     candidate = strsep(&haystack_ptr, separator);
@@ -1108,10 +1110,17 @@ static int uv__find_in_delimited_string(const char* haystack, const char* needle
  * the root (/) with the mount point (/sys/fs/cgroup), resulting in the path
  * /sys/fs/cgroup/foo-slice.
  */
-static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const char* subsystem) {
+static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
+                                       const char* subsystem) {
   FILE* fp;
   /* Buffer to be dynamically (re-)sized by getline(). */
   char* buf;
+  /*
+   * Length of the string contained in `buf` immediately after it's written by
+   * getline().
+   */
+  size_t buf_strlen;
+  /* Current allocated size of `buf`. */
   size_t buf_size;
 
   /* From /proc/self/mountinfo */
@@ -1132,6 +1141,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   char* subsystem_search_string;
 
   buf = NULL;
+  buf_strlen = 0;
   buf_size = 0;
   subsystem_search_string = NULL;
 
@@ -1152,23 +1162,33 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
         break;
       goto file_malformed;
     }
-    if ('\n' == buf[strlen(buf) - 1])
-      buf[strlen(buf) - 1] = '\0';
+    buf_strlen = strlen(buf);
+    if ('\n' == buf[buf_strlen - 1])
+      buf[buf_strlen - 1] = '\0';
 
     field_ptr = buf;
     strsep(&field_ptr, " "); /* mount ID */
     strsep(&field_ptr, " "); /* parent ID */
     strsep(&field_ptr, " "); /* st_dev major:minor */
     curr_root = strsep(&field_ptr, " ");
+    if (curr_root == NULL)
+      continue;
     curr_mount_point = strsep(&field_ptr, " ");
+    if (curr_mount_point == NULL)
+      continue;
     strsep(&field_ptr, " "); /* mount options */
     /* A hyphen marks the end of variable-length optional fields. */
     while ('-' != field_ptr[0])
       strsep(&field_ptr, " ");
     strsep(&field_ptr, " "); /* separator (hyphen) */
     curr_fs_type = strsep(&field_ptr, " ");
+    if (curr_fs_type == NULL)
+      continue;
     strsep(&field_ptr, " "); /* mount source */
     curr_super_options = strsep(&field_ptr, " ");
+    if (curr_super_options == NULL)
+      continue;
+
     /*
      * If the fs type (9) is "cgroup" and super options (11) contains the name
      * of the subsystem, then we've found the correct mount location, so save
@@ -1180,7 +1200,8 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
      */
     if (strcmp(curr_fs_type, "cgroup") == 0) {
       /* cgroups v1 */
-      if (uv__find_in_delimited_string(curr_super_options, subsystem, ",") != 0) {
+      if (0 !=
+          uv__find_in_delimited_string(curr_super_options, subsystem, ",")) {
         uv__strscpy(root, curr_root, sizeof(root));
         uv__strscpy(mount_point, curr_mount_point, sizeof(mount_point));
         info->cgroups_version = CGROUPS_VERSION_1;
@@ -1192,14 +1213,16 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
       uv__strscpy(mount_point, curr_mount_point, sizeof(mount_point));
       info->cgroups_version = CGROUPS_VERSION_2;
       /*
-        * Don't break, as we're not certain that this subsystem is controlled
-        * by cgroups v2.
-        */
+       * Don't break, as we're not certain that this subsystem is controlled
+       * by cgroups v2.
+       */
     }
   }
 
   fclose(fp);
-  uv__free(buf);
+  free(buf);
+  buf = NULL;
+  buf_strlen = 0;
   buf_size = 0;
 
   /*
@@ -1219,6 +1242,10 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
   
   /* + 3 for two colons, and terminal character. */
   subsystem_search_string = uv__malloc(strlen(subsystem) + 3);
+  if (subsystem_search_string == NULL) {
+    fclose(fp);
+    return UV_ENOMEM;
+  }
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
   while (feof(fp) == 0) {
@@ -1227,25 +1254,29 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
         break;
       goto file_malformed;
     }
-    if ('\n' == buf[strlen(buf) - 1])
-      buf[strlen(buf) - 1] = '\0';
+    buf_strlen = strlen(buf);
+    if ('\n' == buf[buf_strlen - 1])
+      buf[buf_strlen - 1] = '\0';
 
     if (CGROUPS_VERSION_1 == info->cgroups_version) {
       hierarchy_path_search_ptr = strstr(buf, subsystem_search_string);
-      if (hierarchy_path_search_ptr)
+      if (hierarchy_path_search_ptr != NULL)
         hierarchy_path_search_ptr += strlen(subsystem_search_string);
     } else { /* if (CGROUPS_VERSION_2 == info->cgroups_version) */
-      if (strncmp(buf, CGROUPS_V2_CTRL_PREFIX, CGROUPS_V2_CTRL_PREFIX_LEN) == 0)
+      /* 3 is the string length of "0::". */
+      if (strncmp(buf, "0::", 3) == 0)
         hierarchy_path_search_ptr = buf + CGROUPS_V2_CTRL_PREFIX_LEN;
     }
     if (hierarchy_path_search_ptr != NULL) {
-      uv__strscpy(hierarchy_path, hierarchy_path_search_ptr, sizeof(hierarchy_path));
+      uv__strscpy(hierarchy_path,
+                  hierarchy_path_search_ptr,
+                  sizeof(hierarchy_path));
       break;
     }
   }
 
   fclose(fp);
-  uv__free(buf);
+  free(buf);
   uv__free(subsystem_search_string);
 
   /*
@@ -1258,6 +1289,8 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
     /* +2 for "/" and null terminator. */
     path_size = strlen(mount_point) + strlen(hierarchy_path_inner) + 2;
     info->path = uv__malloc(path_size);
+    if (info->path == NULL)
+      return UV_ENOMEM;
     snprintf(info->path, path_size, "%s/%s", mount_point, hierarchy_path_inner);
   } else {
     info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
@@ -1266,7 +1299,7 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info, const
 
 file_malformed:
   fclose(fp);
-  uv__free(buf);
+  free(buf);
   uv__free(subsystem_search_string);
   info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
   return UV_EIO;
@@ -1292,7 +1325,7 @@ static uint64_t uv__read_cgroups_uint64(const char* path, const char* param) {
 
   if (n > 0) {
     buf[n] = '\0';
-    if (0 != strcmp(buf, CGROUPS_V2_NO_LIMIT_VALUE))
+    if (0 != strcmp(buf, "max"))
       sscanf(buf, "%" PRIu64, &rc);
   }
 
