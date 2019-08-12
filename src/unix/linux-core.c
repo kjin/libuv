@@ -1112,6 +1112,7 @@ static int uv__find_in_delimited_string(const char* haystack,
  */
 static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
                                        const char* subsystem) {
+  int rc;
   FILE* fp;
   /* Buffer to be dynamically (re-)sized by getline(). */
   char* buf;
@@ -1124,10 +1125,10 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
   size_t buf_size;
 
   /* From /proc/self/mountinfo */
-  char root[UV__PATH_MAX];
-  char mount_point[UV__PATH_MAX];
+  char* root;
+  char* mount_point;
   /* From /proc/self/cgroup */
-  char hierarchy_path[UV__PATH_MAX];
+  char* hierarchy_path;
 
   /* Values used when reading /proc/self/mountinfo */
   char* field_ptr;
@@ -1140,10 +1141,14 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
   const char* hierarchy_path_inner;
   char* subsystem_search_string;
 
+  rc = 0;
   buf = NULL;
   buf_strlen = 0;
   buf_size = 0;
   subsystem_search_string = NULL;
+  root = NULL;
+  mount_point = NULL;
+  hierarchy_path = NULL;
 
   info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
   info->path = NULL;
@@ -1151,8 +1156,19 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
   /* Read /proc/self/mountinfo to get controller path. */
 
   fp = uv__open_file(PROC_SELF_MOUNTINFO);
-  if (fp == NULL)
-    return UV__ERR(errno);
+  if (fp == NULL) {
+    rc = UV__ERR(errno);
+    goto free_mem;
+  }
+
+  root = uv__malloc(UV__PATH_MAX);
+  mount_point = uv__malloc(UV__PATH_MAX);
+  if (root == NULL || mount_point == NULL) {
+    fclose(fp);
+    rc = UV_ENOMEM;
+    goto free_mem;
+  }
+
   /*
    * Loop once per line; try to find the mount location for the given subsystem.
    */
@@ -1160,7 +1176,9 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
     if (getline(&buf, &buf_size, fp) < 0) {
       if (feof(fp) != 0)
         break;
-      goto file_malformed;
+      fclose(fp);
+      rc = UV_EIO;
+      goto free_mem;
     }
     buf_strlen = strlen(buf);
     if ('\n' == buf[buf_strlen - 1])
@@ -1202,15 +1220,21 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
       /* cgroups v1 */
       if (0 !=
           uv__find_in_delimited_string(curr_super_options, subsystem, ",")) {
-        uv__strscpy(root, curr_root, sizeof(root));
-        uv__strscpy(mount_point, curr_mount_point, sizeof(mount_point));
+        if (uv__strscpy(root, curr_root, UV__PATH_MAX - 1) < 0 ||
+            uv__strscpy(mount_point, curr_mount_point, UV__PATH_MAX - 1) < 0) {
+          rc = UV__E2BIG;
+          goto free_mem;
+        }
         info->cgroups_version = CGROUPS_VERSION_1;
         break;
       }
     } else if (strcmp(curr_fs_type, "cgroup2") == 0) {
       /* cgroups v2 */
-      uv__strscpy(root, curr_root, sizeof(root));
-      uv__strscpy(mount_point, curr_mount_point, sizeof(mount_point));
+      if (uv__strscpy(root, curr_root, UV__PATH_MAX - 1) < 0 ||
+          uv__strscpy(mount_point, curr_mount_point, UV__PATH_MAX - 1) < 0) {
+        rc = UV__E2BIG;
+        goto free_mem;
+      }
       info->cgroups_version = CGROUPS_VERSION_2;
       /*
        * Don't break, as we're not certain that this subsystem is controlled
@@ -1229,30 +1253,40 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
    * If cgroups version wasn't determined, assume this subsystem isn't enabled
    * in cgroups, so don't bother reading /proc/self/cgroup.
    */
-  if (CGROUPS_VERSION_UNKNOWN == info->cgroups_version)
-    return 0;
+  if (CGROUPS_VERSION_UNKNOWN == info->cgroups_version) {
+    rc = 0;
+    goto free_mem;
+  }
   
   /* Read /proc/self/cgroup to get hierarchy path. */
 
-  hierarchy_path[0] = '\0';
-
   fp = uv__open_file(PROC_SELF_CGROUP);
-  if (fp == NULL)
-    return UV__ERR(errno);
+  if (fp == NULL) {
+    rc = UV__ERR(errno);
+    goto free_mem;
+  }
   
+  hierarchy_path = uv__malloc(UV__PATH_MAX);
   /* + 3 for two colons, and terminal character. */
   subsystem_search_string = uv__malloc(strlen(subsystem) + 3);
-  if (subsystem_search_string == NULL) {
+  if (hierarchy_path == NULL || subsystem_search_string == NULL) {
     fclose(fp);
-    return UV_ENOMEM;
+    rc = UV_ENOMEM;
+    info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+    goto free_mem;
   }
+
+  hierarchy_path[0] = '\0';
   snprintf(subsystem_search_string, strlen(subsystem) + 3, ":%s:", subsystem);
 
   while (feof(fp) == 0) {
     if (getline(&buf, &buf_size, fp) < 0) {
       if (feof(fp) != 0)
         break;
-      goto file_malformed;
+      fclose(fp);
+      rc = UV_EIO;
+      info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+      goto free_mem;
     }
     buf_strlen = strlen(buf);
     if ('\n' == buf[buf_strlen - 1])
@@ -1265,19 +1299,21 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
     } else { /* if (CGROUPS_VERSION_2 == info->cgroups_version) */
       /* 3 is the string length of "0::". */
       if (strncmp(buf, "0::", 3) == 0)
-        hierarchy_path_search_ptr = buf + CGROUPS_V2_CTRL_PREFIX_LEN;
+        hierarchy_path_search_ptr = buf + 3;
     }
     if (hierarchy_path_search_ptr != NULL) {
-      uv__strscpy(hierarchy_path,
-                  hierarchy_path_search_ptr,
-                  sizeof(hierarchy_path));
+      if (uv__strscpy(hierarchy_path,
+                      hierarchy_path_search_ptr,
+                      UV__PATH_MAX - 1) < 0) {
+        rc = UV__E2BIG;
+        info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+        goto free_mem;
+      }
       break;
     }
   }
 
   fclose(fp);
-  free(buf);
-  uv__free(subsystem_search_string);
 
   /*
    * The hierarchy path should be prefixed with the root path from mountinfo,
@@ -1289,20 +1325,30 @@ static int uv__read_cgroups_proc_files(uv__cgroups_subsystem_info_t* info,
     /* +2 for "/" and null terminator. */
     path_size = strlen(mount_point) + strlen(hierarchy_path_inner) + 2;
     info->path = uv__malloc(path_size);
-    if (info->path == NULL)
-      return UV_ENOMEM;
+    if (info->path == NULL) {
+      rc = UV_ENOMEM;
+      info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
+      goto free_mem;
+    }
     snprintf(info->path, path_size, "%s/%s", mount_point, hierarchy_path_inner);
   } else {
     info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
   }
-  return 0;
 
-file_malformed:
-  fclose(fp);
-  free(buf);
-  uv__free(subsystem_search_string);
-  info->cgroups_version = CGROUPS_VERSION_UNKNOWN;
-  return UV_EIO;
+
+free_mem:
+  /* buf is (re-)allocated via getline, so use standard free. */
+  if (buf != NULL)
+    free(buf);
+  if (root != NULL)
+    uv__free(root);
+  if (mount_point != NULL)
+    uv__free(mount_point);
+  if (hierarchy_path != NULL)
+    uv__free(hierarchy_path);
+  if (subsystem_search_string != NULL)
+    uv__free(subsystem_search_string);
+  return rc;
 }
 
 
